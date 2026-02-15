@@ -19,7 +19,8 @@ from urllib import request as urlrequest
 
 import cv2
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 try:
     import numpy as np
@@ -312,15 +313,23 @@ class PushToTalkRecorder:
         return out_path, duration_s
 
 
-def transcribe_with_openai(client: OpenAI, wav_path: str, model: str, language: str = "") -> str:
+def transcribe_with_gemini(client: genai.Client, wav_path: str, model: str, language: str = "") -> str:
     if not wav_path:
         return ""
     with open(wav_path, "rb") as f:
-        kwargs = {"model": model, "file": f}
-        if language:
-            kwargs["language"] = language
-        result = client.audio.transcriptions.create(**kwargs)
-    text = getattr(result, "text", "") or ""
+        audio_bytes = f.read()
+    lang_hint = f" The language is {language}." if language else ""
+    prompt = f"Transcribe the following audio exactly as spoken.{lang_hint} Output only the transcript text, nothing else."
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(parts=[
+                types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                types.Part.from_text(text=prompt),
+            ]),
+        ],
+    )
+    text = response.text or ""
     return str(text).strip()
 
 
@@ -555,7 +564,7 @@ def clamp_to_max_sentences(text: str, max_sentences: int = 3) -> str:
 
 
 def analyze_with_gpt(
-    client: OpenAI,
+    client: genai.Client,
     model: str,
     system_prompt: str,
     tags_text: str,
@@ -580,15 +589,15 @@ def analyze_with_gpt(
         "Derived cues:\n"
         f"{survival_cues}\n"
     )
-    response = client.responses.create(
+    response = client.models.generate_content(
         model=model,
-        max_output_tokens=max_tokens,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=max_tokens,
+        ),
     )
-    return response.output_text.strip()
+    return (response.text or "").strip()
 
 
 def push_gpt_update(push_url: str, text: str, phase: str, memory_conf: float):
@@ -719,7 +728,7 @@ def parse_args():
         default=4.0,
         help="Seconds of YOLO history to aggregate into robust tags",
     )
-    parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model for survival reasoning")
+    parser.add_argument("--model", default="gemini-2.5-flash", help="Gemini model for survival reasoning")
     parser.add_argument("--max-tokens", type=int, default=260, help="Max output tokens per analysis")
     parser.add_argument("--min-conf", type=float, default=0.35, help="Min YOLO confidence to keep")
     parser.add_argument("--top-k", type=int, default=10, help="Max number of aggregated tags sent to GPT")
@@ -840,8 +849,8 @@ def parse_args():
     )
     parser.add_argument(
         "--transcribe-model",
-        default="gpt-4o-mini-transcribe",
-        help="OpenAI transcription model for push-to-talk",
+        default="gemini-2.5-flash",
+        help="Gemini model for push-to-talk audio transcription",
     )
     parser.add_argument(
         "--transcribe-language",
@@ -912,9 +921,9 @@ def main():
             print("No microphone devices found or sounddevice is not installed.")
         return
 
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
-        print("Missing OPENAI_API_KEY. Set it in your shell or a .env file.")
+        print("Missing GEMINI_API_KEY. Set it in your shell or a .env file.")
         sys.exit(1)
 
     if args.list_cameras:
@@ -946,7 +955,7 @@ def main():
             print(f"Push-to-talk disabled: {exc}")
             ptt_enabled = False
 
-    client = OpenAI(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     memory = ContextMemory(seed_context=args.context, bootstrap_rounds=args.bootstrap_rounds)
 
     try:
@@ -1178,7 +1187,7 @@ def main():
                         last_text = "Twin, I barely caught audio. Hold SPACE and speak a bit longer."
                         speech.speak(last_text)
                     else:
-                        transcript = transcribe_with_openai(
+                        transcript = transcribe_with_gemini(
                             client=client,
                             wav_path=wav_path,
                             model=args.transcribe_model,

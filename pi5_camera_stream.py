@@ -1000,7 +1000,7 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=20, help="Capture/stream FPS")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="MJPEG quality (20-95)")
     parser.add_argument("--serial-port", default="/dev/ttyACM0", help="Arduino serial port")
-    parser.add_argument("--serial-baud", type=int, default=9600, help="Arduino serial baud rate")
+    parser.add_argument("--serial-baud", type=int, default=115200, help="Arduino serial baud rate")
     parser.add_argument(
         "--disable-serial",
         action="store_true",
