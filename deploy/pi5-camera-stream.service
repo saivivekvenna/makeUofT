@@ -1,0 +1,16 @@
+[Unit]
+Description=Pi5 USB Camera MJPEG Stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/makeUofT
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/makeUofT/scripts/pi5_run_stream.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
