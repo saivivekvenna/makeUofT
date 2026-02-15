@@ -160,20 +160,36 @@ def list_audio_output_devices():
 
 
 class SpeechManager:
+    """Cross-platform TTS: macOS `say`, Windows SAPI, Linux `espeak`."""
+
     def __init__(self, enabled: bool, voice: str, rate: int, interrupt: bool):
-        self.enabled = enabled and platform.system() == "Darwin"
+        self._platform = platform.system()
         self.voice = voice
         self.rate = max(120, min(340, int(rate)))
         self.interrupt = interrupt
-        self._queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue()
         self._thread = None
         self._current_proc = None
         self._lock = threading.Lock()
+
+        # Determine which TTS backend is available
+        self._backend = None
+        if enabled:
+            if self._platform == "Darwin" and shutil.which("say"):
+                self._backend = "say"
+            elif self._platform == "Windows":
+                self._backend = "sapi"
+            elif shutil.which("espeak"):
+                self._backend = "espeak"
+            elif shutil.which("espeak-ng"):
+                self._backend = "espeak-ng"
+            else:
+                print("Speech output requested but no TTS engine found (say/espeak/SAPI).")
+
+        self.enabled = self._backend is not None
         if self.enabled:
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
-        elif enabled:
-            print("Speech output requested, but this host is not macOS.")
 
     def speak(self, text: str):
         if not self.enabled:
@@ -213,19 +229,42 @@ class SpeechManager:
             except queue.Empty:
                 return
 
+    def _build_cmd(self, text: str) -> list:
+        if self._backend == "say":
+            return ["say", "-v", self.voice, "-r", str(self.rate), text]
+        if self._backend in ("espeak", "espeak-ng"):
+            wpm = str(self.rate)
+            return [self._backend, "-s", wpm, text]
+        if self._backend == "sapi":
+            # Use PowerShell to invoke Windows SAPI
+            ps_script = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                f"$s.Rate = {max(-10, min(10, (self.rate - 180) // 20))}; "
+                f"$s.Speak('{text.replace(chr(39), chr(39)+chr(39))}');"
+            )
+            return ["powershell", "-NoProfile", "-Command", ps_script]
+        return []
+
     def _worker(self):
         while True:
             text = self._queue.get()
             if text is None:
                 break
-            cmd = ["say", "-v", self.voice, "-r", str(self.rate), text]
+            cmd = self._build_cmd(text)
+            if not cmd:
+                continue
             try:
-                proc = subprocess.Popen(cmd)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 with self._lock:
                     self._current_proc = proc
                 proc.wait()
             except FileNotFoundError:
-                print("macOS 'say' command not available.")
+                print(f"TTS command not available: {cmd[0]}")
                 return
             finally:
                 with self._lock:
@@ -314,23 +353,45 @@ class PushToTalkRecorder:
 
 
 def transcribe_with_gemini(client: genai.Client, wav_path: str, model: str, language: str = "") -> str:
+    """Send audio to Gemini and get back a clean text transcript."""
     if not wav_path:
         return ""
     with open(wav_path, "rb") as f:
         audio_bytes = f.read()
-    lang_hint = f" The language is {language}." if language else ""
-    prompt = f"Transcribe the following audio exactly as spoken.{lang_hint} Output only the transcript text, nothing else."
-    response = client.models.generate_content(
-        model=model,
-        contents=[
-            types.Content(parts=[
-                types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                types.Part.from_text(text=prompt),
-            ]),
-        ],
+    lang_hint = f" The spoken language is {language}." if language else ""
+    prompt = (
+        "You are a speech-to-text transcriber. "
+        "Listen to the audio and output ONLY the exact words spoken, nothing else. "
+        "Do not add punctuation beyond what is natural. "
+        "Do not add commentary, labels, timestamps, or formatting. "
+        "If the audio is unclear or silent, output an empty string."
+        f"{lang_hint}"
     )
-    text = response.text or ""
-    return str(text).strip()
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(parts=[
+                    types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                    types.Part.from_text(text=prompt),
+                ]),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=300,
+            ),
+        )
+        text = (response.text or "").strip()
+        # Strip common Gemini artifacts
+        for prefix in ("Transcript:", "transcript:", "Text:", '"'):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        if text.endswith('"'):
+            text = text[:-1].strip()
+        return text
+    except Exception as exc:
+        print(f"Transcription error: {exc}")
+        return ""
 
 
 class YoloHelper:
@@ -525,28 +586,79 @@ def build_system_prompt(
         "- 2-3 short sentences total in natural speech.\n"
         "- Directly answer Twin's spoken question/request first if given.\n"
         "- Include the top risk and best next action within those 2-3 sentences.\n"
-        "- Do not use section headers or bullet points.\n"
-        "Final line requirement: output one single-line JSON memory update using this exact prefix:\n"
-        'MEMORY_UPDATE_JSON: {"environment":"...","priority":"...","risks":["..."],"resources":["..."],"confidence":0.0}'
+        "- Do not use section headers, bullet points, or markdown formatting.\n"
+        "\n"
+        "CRITICAL — Your response MUST have exactly two parts separated by a blank line:\n"
+        "Part 1: Your spoken advice to Twin (2-3 sentences).\n"
+        "Part 2: A SINGLE line starting with the exact text MEMORY_UPDATE_JSON: followed by a JSON object.\n"
+        "The JSON object must have these keys: environment, priority, risks, resources, confidence.\n"
+        "Do NOT wrap the JSON in code fences or backticks.\n"
+        "Example of the required final line:\n"
+        'MEMORY_UPDATE_JSON: {"environment":"indoor office","priority":"navigate to exit","risks":["low visibility"],"resources":["flashlight nearby"],"confidence":0.7}'
     )
 
 
 def extract_memory_update(analysis_text: str):
-    for line in reversed(analysis_text.splitlines()):
+    """Extract the MEMORY_UPDATE_JSON from the model response.
+
+    Handles Gemini quirks: markdown code fences, extra whitespace,
+    the prefix appearing mid-line, or JSON on the next line.
+    """
+    if not analysis_text:
+        return None
+
+    # Normalise: strip markdown fences that Gemini sometimes wraps JSON in
+    cleaned = analysis_text.replace("```json", "").replace("```", "")
+
+    # Strategy 1: look for lines with the exact prefix
+    for line in reversed(cleaned.splitlines()):
         stripped = line.strip()
         if stripped.startswith(MEMORY_PREFIX):
-            raw_json = stripped[len(MEMORY_PREFIX) :].strip()
+            raw_json = stripped[len(MEMORY_PREFIX):].strip()
             try:
                 return json.loads(raw_json)
             except json.JSONDecodeError:
-                return None
+                pass
+
+    # Strategy 2: find the prefix anywhere and grab JSON after it
+    idx = cleaned.rfind(MEMORY_PREFIX)
+    if idx >= 0:
+        after = cleaned[idx + len(MEMORY_PREFIX):].strip()
+        # Grab from first { to last }
+        brace_start = after.find("{")
+        brace_end = after.rfind("}")
+        if brace_start >= 0 and brace_end > brace_start:
+            raw_json = after[brace_start:brace_end + 1]
+            try:
+                return json.loads(raw_json)
+            except json.JSONDecodeError:
+                pass
+
+    # Strategy 3: find any JSON object with expected keys as last resort
+    for m in re.finditer(r'\{[^{}]*"environment"[^{}]*\}', cleaned):
+        try:
+            candidate = json.loads(m.group())
+            if "environment" in candidate:
+                return candidate
+        except json.JSONDecodeError:
+            continue
+
     return None
 
 
 def strip_memory_line(analysis_text: str) -> str:
+    """Remove the MEMORY_UPDATE_JSON line and any markdown code fences from the spoken output."""
     cleaned = []
     for line in analysis_text.splitlines():
-        if line.strip().startswith(MEMORY_PREFIX):
+        stripped = line.strip()
+        # Skip the memory JSON line
+        if MEMORY_PREFIX in stripped:
+            continue
+        # Skip markdown code fences that Gemini sometimes adds
+        if stripped in ("```json", "```", "```JSON"):
+            continue
+        # Skip lines that are just raw JSON objects (fallback memory)
+        if stripped.startswith("{") and stripped.endswith("}") and "environment" in stripped:
             continue
         cleaned.append(line)
     return "\n".join(cleaned).strip()
@@ -587,17 +699,24 @@ def analyze_with_gpt(
         "External sensor state:\n"
         f"{sensor_text}\n\n"
         "Derived cues:\n"
-        f"{survival_cues}\n"
+        f"{survival_cues}\n\n"
+        "IMPORTANT — your final line MUST be exactly this format with no markdown or code fences:\n"
+        'MEMORY_UPDATE_JSON: {"environment":"...","priority":"...","risks":["..."],"resources":["..."],"confidence":0.0}\n'
     )
-    response = client.models.generate_content(
-        model=model,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=max_tokens,
-        ),
-    )
-    return (response.text or "").strip()
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+            ),
+        )
+        return (response.text or "").strip()
+    except Exception as exc:
+        print(f"Gemini API error: {exc}")
+        return "Twin, I had a momentary communication issue. Stay aware of your surroundings."
 
 
 def push_gpt_update(push_url: str, text: str, phase: str, memory_conf: float):

@@ -20,6 +20,11 @@ try:
 except Exception:
     serial = None
 
+try:
+    from gpiozero import AngularServo
+except Exception:
+    AngularServo = None
+
 DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -614,6 +619,56 @@ class CameraSource:
             return self.latest_jpeg
 
 
+class ServoCompass:
+    """Drive a servo directly from Pi5 GPIO using gpiozero."""
+
+    def __init__(self, gpio_pin: int = 18, enabled: bool = True):
+        self.gpio_pin = gpio_pin
+        self.enabled = enabled
+        self.servo = None
+        self._last_angle = -1
+        if not enabled:
+            return
+        if AngularServo is None:
+            print("Servo disabled: gpiozero is not installed.")
+            self.enabled = False
+            return
+        try:
+            self.servo = AngularServo(
+                gpio_pin,
+                min_angle=0,
+                max_angle=180,
+                min_pulse_width=0.5 / 1000,
+                max_pulse_width=2.5 / 1000,
+            )
+            self.servo.angle = 90  # start centered
+            self._last_angle = 90
+            print(f"Servo compass attached on GPIO {gpio_pin}.")
+        except Exception as exc:
+            print(f"Servo init failed on GPIO {gpio_pin}: {exc}")
+            self.enabled = False
+
+    def set_angle(self, angle: int):
+        """Set servo angle (0-180). Deduplicates unchanged values."""
+        if not self.enabled or self.servo is None:
+            return
+        angle = max(0, min(180, int(angle)))
+        if angle == self._last_angle:
+            return
+        try:
+            self.servo.angle = angle
+            self._last_angle = angle
+        except Exception as exc:
+            print(f"[Servo] write failed: {exc}")
+
+    def stop(self):
+        if self.servo is not None:
+            try:
+                self.servo.close()
+            except Exception:
+                pass
+
+
 class SerialSensorSource:
     def __init__(self, port: str, baud: int, enabled: bool, hr_delta_alert: int, log_raw: bool):
         self.port = port
@@ -625,9 +680,6 @@ class SerialSensorSource:
         self.running = False
         self.thread = None
         self.connected = False
-        self._ser = None  # shared serial handle for read + write
-        self._ser_lock = threading.Lock()  # guards write access
-        self._last_servo_angle = -1  # dedup: only write on change
         self.latest = {
             "heart_rate": None,
             "left": 0,
@@ -660,21 +712,6 @@ class SerialSensorSource:
             state["connected"] = self.connected
         return state
 
-    def write_servo(self, angle: int):
-        """Send a servo angle command to the Arduino (0-180)."""
-        angle = max(0, min(180, int(angle)))
-        if angle == self._last_servo_angle:
-            return  # no change, skip write
-        with self._ser_lock:
-            if self._ser is None or not self.connected:
-                return
-            try:
-                cmd = f"SERVO:{angle}\n"
-                self._ser.write(cmd.encode("utf-8"))
-                self._last_servo_angle = angle
-            except Exception as exc:
-                print(f"[Serial] servo write failed: {exc}")
-
     def _append_event(self, kind: str, text: str):
         self.events.append(
             {
@@ -685,12 +722,12 @@ class SerialSensorSource:
         )
 
     def _read_loop(self):
+        ser = None
         while self.running:
-            if self._ser is None:
+            if ser is None:
                 try:
-                    with self._ser_lock:
-                        self._ser = serial.Serial(self.port, self.baud, timeout=1)
-                        self._ser.reset_input_buffer()
+                    ser = serial.Serial(self.port, self.baud, timeout=1)
+                    ser.reset_input_buffer()
                     self.connected = True
                     self._append_event("status", f"Serial connected on {self.port}")
                 except Exception:
@@ -698,14 +735,13 @@ class SerialSensorSource:
                     time.sleep(1.0)
                     continue
             try:
-                raw = self._ser.readline().decode("utf-8", errors="ignore").rstrip()
+                raw = ser.readline().decode("utf-8", errors="ignore").rstrip()
             except Exception:
                 try:
-                    with self._ser_lock:
-                        self._ser.close()
-                        self._ser = None
+                    ser.close()
                 except Exception:
-                    self._ser = None
+                    pass
+                ser = None
                 self.connected = False
                 time.sleep(0.5)
                 continue
@@ -1032,7 +1068,13 @@ def parse_args():
         "--servo-update-hz",
         type=float,
         default=10.0,
-        help="How often to send servo angle updates to Arduino (Hz)",
+        help="How often to update the compass servo position (Hz)",
+    )
+    parser.add_argument(
+        "--servo-gpio",
+        type=int,
+        default=18,
+        help="GPIO pin (BCM) for compass servo signal (default: 18 = physical pin 12)",
     )
     return parser.parse_args()
 
@@ -1066,7 +1108,8 @@ def main():
     )
     sensors.start()
 
-    # Servo update loop: periodically push compass heading to Arduino servo
+    # Servo compass – driven directly from Pi5 GPIO
+    servo = ServoCompass(gpio_pin=args.servo_gpio, enabled=compass_enabled)
     servo_stop_event = threading.Event()
 
     def _servo_loop():
@@ -1074,11 +1117,11 @@ def main():
         while not servo_stop_event.is_set():
             if rotation_tracker is not None:
                 state = rotation_tracker.get_state()
-                sensors.write_servo(state["servo_angle"])
+                servo.set_angle(state["servo_angle"])
             servo_stop_event.wait(interval)
 
     servo_thread = None
-    if compass_enabled and not args.disable_serial:
+    if compass_enabled and servo.enabled:
         servo_thread = threading.Thread(target=_servo_loop, daemon=True)
         servo_thread.start()
 
@@ -1092,7 +1135,7 @@ def main():
     if camera.active_source is not None:
         print(f"Camera source selected: {camera.active_source}")
     if compass_enabled:
-        print("Compass rotation tracking enabled (servo output via serial).")
+        print(f"Compass rotation tracking enabled (servo on GPIO {args.servo_gpio}).")
     print(
         "Endpoints: / (dashboard), /video (raw MJPEG), /annotated-video (YOLO MJPEG), "
         "/health, /sensor-state, /gpt-feed, /gpt-log, /gpt-control, /annotated-frame, "
@@ -1106,6 +1149,7 @@ def main():
         servo_stop_event.set()
         if servo_thread is not None:
             servo_thread.join(timeout=1.0)
+        servo.stop()
         httpd.server_close()
         camera.stop()
         sensors.stop()
