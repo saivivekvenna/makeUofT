@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import json
 import threading
@@ -8,7 +10,11 @@ from datetime import datetime, timezone
 from http import server
 from socketserver import ThreadingMixIn
 
+import math
+
 import cv2
+import numpy as np
+
 try:
     import serial
 except Exception:
@@ -38,7 +44,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
     .wrap {
       display: grid;
-      grid-template-columns: minmax(360px, 2fr) minmax(280px, 1fr);
+      grid-template-columns: minmax(360px, 2fr) minmax(220px, 1fr) 180px;
       gap: 16px;
       padding: 16px;
       min-height: 100vh;
@@ -131,6 +137,26 @@ DASHBOARD_HTML = """<!doctype html>
       border-radius: 10px;
       padding: 12px;
     }
+    .compass-box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 14px 8px;
+      gap: 8px;
+    }
+    .compass-box canvas {
+      border-radius: 50%;
+      border: 1px solid var(--line);
+    }
+    .compass-label {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .compass-sub {
+      font-size: 12px;
+      color: var(--muted);
+    }
     @media (max-width: 980px) {
       .wrap { grid-template-columns: 1fr; }
       .feed { height: auto; max-height: 45vh; }
@@ -158,6 +184,17 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div id="feed" class="feed">
         <div class="empty">No GPT output received yet. Start the laptop assistant with `--gpt-push-url`.</div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head">
+        <span>Compass</span>
+        <span class="status"><span class="dot"></span>TRACKING</span>
+      </div>
+      <div class="compass-box">
+        <canvas id="compassCanvas" width="140" height="140"></canvas>
+        <span id="headingValue" class="compass-label">0.0\u00b0</span>
+        <span id="servoValue" class="compass-sub">servo 90\u00b0</span>
       </div>
     </section>
   </div>
@@ -249,10 +286,209 @@ DASHBOARD_HTML = """<!doctype html>
     pollControl();
     poll();
     setInterval(poll, 1500);
+
+    /* --- Compass widget --- */
+    const compassCanvas = document.getElementById("compassCanvas");
+    const headingEl = document.getElementById("headingValue");
+    const servoEl = document.getElementById("servoValue");
+    function drawCompass(angleDeg) {
+      const ctx = compassCanvas.getContext("2d");
+      const W = compassCanvas.width, H = compassCanvas.height;
+      const cx = W / 2, cy = H / 2, r = Math.min(cx, cy) - 6;
+      ctx.clearRect(0, 0, W, H);
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#334155"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, r - 6, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#1e293b"; ctx.lineWidth = 1; ctx.stroke();
+      ["N","E","S","W"].forEach((l, i) => {
+        const a = (i * 90 - 90) * Math.PI / 180;
+        ctx.fillStyle = l==="N" ? "#22c55e" : "#94a3b8";
+        ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(l, cx + (r - 18) * Math.cos(a), cy + (r - 18) * Math.sin(a));
+      });
+      const rad = (-angleDeg + 90) * Math.PI / 180;
+      ctx.beginPath();
+      ctx.moveTo(cx + r * 0.6 * Math.cos(rad), cy - r * 0.6 * Math.sin(rad));
+      ctx.lineTo(cx + r * 0.15 * Math.cos(rad + 2.5), cy - r * 0.15 * Math.sin(rad + 2.5));
+      ctx.lineTo(cx + r * 0.15 * Math.cos(rad - 2.5), cy - r * 0.15 * Math.sin(rad - 2.5));
+      ctx.closePath(); ctx.fillStyle = "#ef4444"; ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.35 * Math.cos(rad), cy + r * 0.35 * Math.sin(rad));
+      ctx.lineTo(cx + r * 0.15 * Math.cos(rad + 2.5), cy - r * 0.15 * Math.sin(rad + 2.5));
+      ctx.lineTo(cx + r * 0.15 * Math.cos(rad - 2.5), cy - r * 0.15 * Math.sin(rad - 2.5));
+      ctx.closePath(); ctx.fillStyle = "#94a3b8"; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#e5e7eb"; ctx.fill();
+    }
+    drawCompass(0);
+    async function pollCompass() {
+      try {
+        const resp = await fetch("/compass-state", { cache: "no-store" });
+        const data = await resp.json();
+        const heading = data.heading_deg != null ? data.heading_deg : 0;
+        const servo = data.servo_angle != null ? data.servo_angle : 90;
+        drawCompass(heading);
+        headingEl.textContent = heading.toFixed(1) + "\u00b0";
+        servoEl.textContent = "servo " + servo + "\u00b0";
+      } catch(e) {}
+    }
+    pollCompass();
+    setInterval(pollCompass, 300);
   </script>
 </body>
 </html>
 """
+
+
+# ---------------------------------------------------------------------------
+# Rotation tracker – sparse optical flow + affine estimation
+# ---------------------------------------------------------------------------
+
+
+class RotationTracker:
+    """Detects cumulative camera yaw rotation using sparse optical flow.
+
+    Uses goodFeaturesToTrack + calcOpticalFlowPyrLK to find point
+    correspondences between consecutive frames, then extracts the
+    rotation angle via estimateAffinePartial2D (similarity transform
+    with RANSAC, robust to moving objects).
+
+    The cumulative heading starts at 0 degrees and grows/shrinks as
+    the camera pans left/right.  The servo angle is derived by mapping
+    the heading into the 0-180 range.
+    """
+
+    _DOWNSCALE_WIDTH = 320  # process at low res for speed
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        smoothing: float = 0.4,
+        min_features: int = 40,
+        max_features: int = 200,
+    ):
+        self.enabled = enabled
+        self.smoothing = max(0.0, min(1.0, smoothing))
+        self.min_features = max(10, int(min_features))
+        self.max_features = max(self.min_features, int(max_features))
+        self.lock = threading.Lock()
+
+        # Internal state
+        self._prev_gray = None
+        self._prev_pts = None
+        self._heading_deg = 0.0        # cumulative raw heading
+        self._smooth_heading = 0.0     # EMA-smoothed heading
+        self._servo_angle = 90         # mapped servo position
+        self._frame_count = 0
+
+        # Shi-Tomasi corner detection params
+        self._feature_params = dict(
+            maxCorners=self.max_features,
+            qualityLevel=0.05,
+            minDistance=12,
+            blockSize=7,
+        )
+        # Lucas-Kanade optical flow params
+        self._lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+
+    def update(self, frame):
+        """Feed a new BGR frame; returns current (heading_deg, servo_angle)."""
+        if not self.enabled:
+            return self._heading_deg, self._servo_angle
+
+        # Downscale for speed
+        h, w = frame.shape[:2]
+        scale = self._DOWNSCALE_WIDTH / float(max(1, w))
+        if scale < 0.95:
+            small = cv2.resize(frame, (self._DOWNSCALE_WIDTH, int(h * scale)),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+            scale = 1.0
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        if self._prev_gray is None or self._prev_pts is None or len(self._prev_pts) < self.min_features:
+            self._prev_gray = gray
+            self._prev_pts = cv2.goodFeaturesToTrack(gray, **self._feature_params)
+            self._frame_count += 1
+            return self._heading_deg, self._servo_angle
+
+        # Compute sparse optical flow
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray, gray, self._prev_pts, None, **self._lk_params
+        )
+        if next_pts is None or status is None:
+            self._prev_gray = gray
+            self._prev_pts = cv2.goodFeaturesToTrack(gray, **self._feature_params)
+            return self._heading_deg, self._servo_angle
+
+        # Keep only successfully tracked points
+        mask = status.flatten() == 1
+        if mask.sum() < 6:
+            self._prev_gray = gray
+            self._prev_pts = cv2.goodFeaturesToTrack(gray, **self._feature_params)
+            return self._heading_deg, self._servo_angle
+
+        prev_good = self._prev_pts[mask]
+        next_good = next_pts[mask]
+
+        # Estimate similarity transform (rotation + translation + uniform scale)
+        mat, inliers = cv2.estimateAffinePartial2D(
+            prev_good, next_good, method=cv2.RANSAC, ransacReprojThreshold=3.0
+        )
+        if mat is not None:
+            # mat is 2x3: [[cos*s, -sin*s, tx], [sin*s, cos*s, ty]]
+            angle_rad = math.atan2(mat[1, 0], mat[0, 0])
+            angle_deg = math.degrees(angle_rad)
+
+            # Reject implausible single-frame rotations (> 15 deg likely a glitch)
+            if abs(angle_deg) < 15.0:
+                self._heading_deg += angle_deg
+                # Normalize to -180..180
+                self._heading_deg = (self._heading_deg + 180) % 360 - 180
+
+        # Exponential moving average smoothing
+        self._smooth_heading += self.smoothing * (self._heading_deg - self._smooth_heading)
+
+        # Map heading to servo: heading 0 -> servo 90 (center/backward),
+        # heading -90 -> servo 180, heading +90 -> servo 0
+        servo = 90 - self._smooth_heading
+        servo = max(0, min(180, int(round(servo))))
+
+        with self.lock:
+            self._servo_angle = servo
+
+        # Refresh features periodically or when count drops
+        self._frame_count += 1
+        if self._frame_count % 5 == 0 or mask.sum() < self.min_features:
+            self._prev_pts = cv2.goodFeaturesToTrack(gray, **self._feature_params)
+        else:
+            self._prev_pts = next_good.reshape(-1, 1, 2)
+        self._prev_gray = gray
+
+        return self._smooth_heading, servo
+
+    def get_state(self):
+        """Thread-safe snapshot of heading and servo angle."""
+        with self.lock:
+            return {
+                "heading_deg": round(self._smooth_heading, 1),
+                "servo_angle": self._servo_angle,
+            }
+
+    def reset(self):
+        """Reset heading to zero (re-center compass)."""
+        with self.lock:
+            self._heading_deg = 0.0
+            self._smooth_heading = 0.0
+            self._servo_angle = 90
+        self._prev_gray = None
+        self._prev_pts = None
 
 
 class CameraSource:
@@ -264,6 +500,7 @@ class CameraSource:
         fps: int,
         jpeg_quality: int,
         device_path: str = "",
+        rotation_tracker: RotationTracker | None = None,
     ):
         self.index = index
         self.width = width
@@ -277,6 +514,7 @@ class CameraSource:
         self.thread = None
         self.cap = None
         self.active_source = None
+        self.rotation_tracker = rotation_tracker
 
     def start(self):
         self.cap = self._open_camera()
@@ -310,6 +548,11 @@ class CameraSource:
                 time.sleep(0.05)
                 continue
             consecutive_failures = 0
+
+            # Run rotation tracking on the raw frame
+            if self.rotation_tracker is not None:
+                self.rotation_tracker.update(frame)
+
             ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if not ok:
                 time.sleep(0.01)
@@ -382,6 +625,9 @@ class SerialSensorSource:
         self.running = False
         self.thread = None
         self.connected = False
+        self._ser = None  # shared serial handle for read + write
+        self._ser_lock = threading.Lock()  # guards write access
+        self._last_servo_angle = -1  # dedup: only write on change
         self.latest = {
             "heart_rate": None,
             "left": 0,
@@ -414,6 +660,21 @@ class SerialSensorSource:
             state["connected"] = self.connected
         return state
 
+    def write_servo(self, angle: int):
+        """Send a servo angle command to the Arduino (0-180)."""
+        angle = max(0, min(180, int(angle)))
+        if angle == self._last_servo_angle:
+            return  # no change, skip write
+        with self._ser_lock:
+            if self._ser is None or not self.connected:
+                return
+            try:
+                cmd = f"SERVO:{angle}\n"
+                self._ser.write(cmd.encode("utf-8"))
+                self._last_servo_angle = angle
+            except Exception as exc:
+                print(f"[Serial] servo write failed: {exc}")
+
     def _append_event(self, kind: str, text: str):
         self.events.append(
             {
@@ -424,12 +685,12 @@ class SerialSensorSource:
         )
 
     def _read_loop(self):
-        ser = None
         while self.running:
-            if ser is None:
+            if self._ser is None:
                 try:
-                    ser = serial.Serial(self.port, self.baud, timeout=1)
-                    ser.reset_input_buffer()
+                    with self._ser_lock:
+                        self._ser = serial.Serial(self.port, self.baud, timeout=1)
+                        self._ser.reset_input_buffer()
                     self.connected = True
                     self._append_event("status", f"Serial connected on {self.port}")
                 except Exception:
@@ -437,13 +698,14 @@ class SerialSensorSource:
                     time.sleep(1.0)
                     continue
             try:
-                raw = ser.readline().decode("utf-8", errors="ignore").rstrip()
+                raw = self._ser.readline().decode("utf-8", errors="ignore").rstrip()
             except Exception:
                 try:
-                    ser.close()
+                    with self._ser_lock:
+                        self._ser.close()
+                        self._ser = None
                 except Exception:
-                    pass
-                ser = None
+                    self._ser = None
                 self.connected = False
                 time.sleep(0.5)
                 continue
@@ -514,6 +776,7 @@ class MJPEGHandler(server.BaseHTTPRequestHandler):
     gpt_paused = False
     control_lock = threading.Lock()
     sensors = None
+    rotation_tracker = None
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -575,6 +838,16 @@ class MJPEGHandler(server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode("utf-8"))
+            return
+
+        if self.path == "/compass-state":
+            state = {"ok": True, "heading_deg": 0.0, "servo_angle": 90}
+            if self.rotation_tracker is not None:
+                state.update(self.rotation_tracker.get_state())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(state).encode("utf-8"))
             return
 
         if self.path not in ("/video", "/annotated-video"):
@@ -692,6 +965,15 @@ class MJPEGHandler(server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"ok": True, "bytes": len(raw_body)}).encode("utf-8"))
             return
 
+        if self.path == "/compass-reset":
+            if self.rotation_tracker is not None:
+                self.rotation_tracker.reset()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "heading_deg": 0.0, "servo_angle": 90}).encode("utf-8"))
+            return
+
         self.send_error(404, "Not found")
 
     def log_message(self, fmt, *args):
@@ -735,11 +1017,36 @@ def parse_args():
         action="store_true",
         help="Disable printing raw Arduino serial lines to logs",
     )
+    parser.add_argument(
+        "--disable-compass",
+        action="store_true",
+        help="Disable camera rotation tracking and servo compass",
+    )
+    parser.add_argument(
+        "--compass-smoothing",
+        type=float,
+        default=0.4,
+        help="EMA smoothing factor for compass heading (0-1, lower = smoother)",
+    )
+    parser.add_argument(
+        "--servo-update-hz",
+        type=float,
+        default=10.0,
+        help="How often to send servo angle updates to Arduino (Hz)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Rotation tracker (compass)
+    compass_enabled = not args.disable_compass
+    rotation_tracker = RotationTracker(
+        enabled=compass_enabled,
+        smoothing=args.compass_smoothing,
+    ) if compass_enabled else None
+
     camera = CameraSource(
         index=args.camera_index,
         width=args.width,
@@ -747,6 +1054,7 @@ def main():
         fps=args.fps,
         jpeg_quality=args.jpeg_quality,
         device_path=args.camera_device,
+        rotation_tracker=rotation_tracker,
     )
     camera.start()
     sensors = SerialSensorSource(
@@ -758,23 +1066,46 @@ def main():
     )
     sensors.start()
 
+    # Servo update loop: periodically push compass heading to Arduino servo
+    servo_stop_event = threading.Event()
+
+    def _servo_loop():
+        interval = 1.0 / max(1.0, float(args.servo_update_hz))
+        while not servo_stop_event.is_set():
+            if rotation_tracker is not None:
+                state = rotation_tracker.get_state()
+                sensors.write_servo(state["servo_angle"])
+            servo_stop_event.wait(interval)
+
+    servo_thread = None
+    if compass_enabled and not args.disable_serial:
+        servo_thread = threading.Thread(target=_servo_loop, daemon=True)
+        servo_thread.start()
+
     MJPEGHandler.camera = camera
     MJPEGHandler.target_fps = max(1, args.fps)
     MJPEGHandler.sensors = sensors
+    MJPEGHandler.rotation_tracker = rotation_tracker
 
     httpd = ThreadedHTTPServer((args.host, args.port), MJPEGHandler)
     print(f"Pi5 stream server ready on http://{args.host}:{args.port}")
     if camera.active_source is not None:
         print(f"Camera source selected: {camera.active_source}")
+    if compass_enabled:
+        print("Compass rotation tracking enabled (servo output via serial).")
     print(
         "Endpoints: / (dashboard), /video (raw MJPEG), /annotated-video (YOLO MJPEG), "
-        "/health, /sensor-state, /gpt-feed, /gpt-log, /gpt-control, /annotated-frame"
+        "/health, /sensor-state, /gpt-feed, /gpt-log, /gpt-control, /annotated-frame, "
+        "/compass-state, /compass-reset"
     )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        servo_stop_event.set()
+        if servo_thread is not None:
+            servo_thread.join(timeout=1.0)
         httpd.server_close()
         camera.stop()
         sensors.stop()
