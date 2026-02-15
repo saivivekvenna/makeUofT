@@ -498,9 +498,13 @@ def build_system_prompt(
         "You are a real-time survival assistant speaking directly to the user.\n"
         "Address the user as 'Twin'.\n"
         "Use a natural, supportive Gen Z vibe: short, conversational, practical, and not cringe.\n"
-        "No roleplay, no emojis, no excessive slang.\n"
+        "No emojis, no excessive slang.\n"
+        "Treat every interaction as a D-Day style high-stakes survival scenario.\n"
+        "Tone should be urgent, tactical, and focused on immediate survival decisions.\n"
         "Goal: keep Twin safe using environment understanding.\n"
         "You receive YOLO-derived object tags aggregated across time, not raw frames.\n"
+        "Speak as if you have direct visual awareness of the current scene.\n"
+        "Never say you cannot see, never mention cameras/models/tags/system limits.\n"
         f"Window size: last {window_seconds:.1f} seconds.\n"
         f"User context: {user_context}\n"
         f"{phase_line}\n"
@@ -510,6 +514,7 @@ def build_system_prompt(
         "If a user voice request is present, answer that request directly first, then ground it in environment context.\n"
         "Infer the likely environment and prioritize immediate survival-oriented advice.\n"
         "Prefer de-escalation, distance from hazards, stable shelter/exit options, hydration, and communication.\n"
+        "Do not mention heart rate unless Twin explicitly asks about heart rate/pulse/BPM.\n"
         "Be explicit about uncertainty and avoid overclaiming.\n"
         "Output style rules:\n"
         "- Start with 'Twin,'.\n"
@@ -673,23 +678,30 @@ def fetch_sensor_state(sensor_url: str, fallback: dict):
     return fallback
 
 
-def format_sensor_text(sensor_state: dict, include_movement: bool) -> str:
+def format_sensor_text(sensor_state: dict, include_movement: bool, include_heart_rate: bool) -> str:
     if not isinstance(sensor_state, dict) or not sensor_state:
         return "No sensor data available."
-    heart_rate = sensor_state.get("heart_rate")
     speak_button = int(sensor_state.get("speak_button") or 0)
     updated_at = sensor_state.get("updated_at") or "unknown"
     connected = bool(sensor_state.get("connected", True))
-    base = (
-        f"connected={connected}, updated_at={updated_at}, heart_rate={heart_rate}, "
-        f"speak_button={speak_button}"
-    )
+    base = f"connected={connected}, updated_at={updated_at}, speak_button={speak_button}"
+    if include_heart_rate:
+        heart_rate = sensor_state.get("heart_rate")
+        base = f"{base}, heart_rate={heart_rate}"
     if not include_movement:
         return base
     left = int(sensor_state.get("left") or 0)
     right = int(sensor_state.get("right") or 0)
     behind = int(sensor_state.get("behind") or 0)
     return f"{base}, left={left}, right={right}, behind={behind}"
+
+
+def user_asked_about_heart_rate(user_voice_prompt: str) -> bool:
+    text = (user_voice_prompt or "").strip().lower()
+    if not text:
+        return False
+    keywords = ("heart rate", "heartbeat", "pulse", "bpm", "heart monitor")
+    return any(k in text for k in keywords)
 
 
 def parse_args():
@@ -1016,9 +1028,11 @@ def main():
         tags = scene_state.summarize(top_k=args.top_k)
         tags_text = format_tags(tags)
         survival_cues = derive_survival_cues(tags)
+        include_heart_rate = user_asked_about_heart_rate(user_voice_prompt)
         sensor_text = format_sensor_text(
             sensor_state=sensor_state,
             include_movement=args.include_movement_in_gpt,
+            include_heart_rate=include_heart_rate,
         )
         system_prompt = build_system_prompt(
             user_context=args.context,
@@ -1101,9 +1115,10 @@ def main():
                         and isinstance(curr_hr, (int, float))
                         and abs(int(curr_hr) - int(prev_hr)) >= max(1, args.heart_rate_alert_delta)
                     ):
-                        alert = f"Twin, heart rate changed from {int(prev_hr)} to {int(curr_hr)}."
-                        print(alert)
-                        speech.speak(alert)
+                        print(
+                            f"[Sensor] heart rate changed from {int(prev_hr)} to {int(curr_hr)} "
+                            "(kept silent unless user asks)"
+                        )
 
                     for direction_key, direction_name in (
                         ("left", "left"),
